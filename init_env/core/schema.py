@@ -1,0 +1,97 @@
+SCHEMA = {
+    "t1": {
+        "pk": "c1",
+        "columns": {
+            "c1": "int",
+            "c2": "str",
+            "c3": "str",
+            "c4": "int",
+            "c5": "date",
+            "c6": "str",
+        },
+        "column_meta": {
+            "c2": {"max_len": 255},
+            "c3": {"max_len": 255},
+            "c5": {},
+            "c6": {"max_len": 10},
+        },
+        "partitioning": {},
+        "foreign_keys": [],
+    },
+    "t2": {
+        "pk": "c1",
+        "columns": {
+            "c1": "int",
+            "c2": "int",
+            "c3": "dec",
+            "c4": "str",
+            "c5": "date",
+            "c6": "str",
+            "c7": "str",
+            "c8": "bin",
+            "c9": "bin",
+            "c10": "str",
+            "c11": "str",
+            "c12": "bin",
+            "c13": "datetime",
+            "c14": "float",
+            "c15": "double",
+            "c16": "json",
+        },
+        "column_meta": {
+            "c2": {},
+            "c3": {},
+            "c4": {"max_len": 50},
+            "c5": {},
+            "c10": {"enum_values": ["value1", "value2", "value3"]},
+            "c11": {"set_values": ["a", "b", "c", "d"]},
+            "c12": {"max_bytes": 1},
+        },
+        "partitioning": {},
+        "foreign_keys": [
+            {"column": "c2", "ref_table": "t1", "ref_column": "c1"}
+        ],
+    },
+    "t3": {
+        "pk": "c1",
+        "columns": {
+            "c1": "int",
+            "c2": "int",
+            "c3": "int",
+            "c4": "year",
+            "c5": "datetime",
+            "c6": "int",
+            "c7": "int",
+            "c8": "int",
+            "c9": "bigint",
+            "c10": "str",
+            "c11": "geom",
+            "c12": "str",
+            "c13": "bin",
+            "c14": "str",
+            "c15": "bool",
+        },
+        "column_meta": {
+            "c2": {},
+            "c3": {},
+            "c4": {"min": 1970, "max": 2030},
+            "c6": {"min": -128, "max": 127},
+            "c7": {"min": -32768, "max": 32767},
+            "c8": {"min": -8388608, "max": 8388607},
+            "c10": {"max_len": 256},
+            "c12": {"max_len": 255},
+            "c13": {"max_bytes": 255},
+            "c14": {"set_values": ["x", "y", "z"]},
+            "c15": {"min": 0, "max": 1},
+        },
+        "partitioning": {},
+        "foreign_keys": [
+            {"column": "c2", "ref_table": "t1", "ref_column": "c1"},
+            {"column": "c3", "ref_table": "t2", "ref_column": "c1"},
+        ],
+    },
+}
+
+
+def get_schema() -> dict:
+    return SCHEMA
