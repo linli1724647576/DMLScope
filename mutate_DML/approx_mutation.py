@@ -421,18 +421,26 @@ class ApproximateMutator:
         sql = self._rewrite_duckdb_replace_set(sql)
         return sql
 
+    def _parse_read_dialects(self) -> tuple[str, ...]:
+        primary = (self.sqlglot_dialect or "").strip().lower() or "mysql"
+        reads: list[str] = [primary]
+        # DuckDB statements can still contain a few MySQL-isms before rewrite;
+        # keep mysql as a fallback, but never ahead of the dialect parser.
+        if self.dialect == "duckdb":
+            reads.append("mysql")
+        # Preserve order and remove duplicates.
+        return tuple(dict.fromkeys(reads))
+
     def _parse_sql_best_effort(self, sql: str) -> exp.Expression:
         source_sql = normalize_sqlglot_input(self._normalize_duckdb_source_sql(sql), self.dialect)
-        if self.dialect == "duckdb":
-            last_exc: Exception | None = None
-            for read in ("mysql", "duckdb"):
-                try:
-                    return sqlglot.parse_one(source_sql, read=read)
-                except Exception as exc:
-                    last_exc = exc
-            assert last_exc is not None
-            raise last_exc
-        return sqlglot.parse_one(source_sql, read=self.sqlglot_dialect)
+        last_exc: Exception | None = None
+        for read in self._parse_read_dialects():
+            try:
+                return sqlglot.parse_one(source_sql, read=read)
+            except Exception as exc:
+                last_exc = exc
+        assert last_exc is not None
+        raise last_exc
 
     def _aggregate_argument(self, agg: exp.Expression) -> exp.Expression:
         arg = agg.args.get("this")
@@ -459,6 +467,18 @@ class ApproximateMutator:
             return node.name.upper() in self._ANONYMOUS_AGGREGATES
         return False
 
+    def _expr_has_aggregate(self, node: exp.Expression | None) -> bool:
+        if node is None:
+            return False
+        for sub in node.walk():
+            if not isinstance(sub, exp.Expression):
+                continue
+            if isinstance(sub, exp.Window) and self._is_aggregate_like(sub.this):
+                return True
+            if self._is_aggregate_like(sub):
+                return True
+        return False
+
     def _nearest_select(self, node: exp.Expression) -> exp.Select | None:
         current: exp.Expression | None = node
         while current is not None:
@@ -471,8 +491,8 @@ class ApproximateMutator:
         current: exp.Expression | None = select
         while current is not None:
             parent = current.parent
-            if isinstance(parent, exp.Subquery) and self._is_scalar_subquery(parent):
-                return True
+            if isinstance(parent, exp.Subquery):
+                return self._is_scalar_subquery(parent)
             current = parent
         return False
 
@@ -533,23 +553,31 @@ class ApproximateMutator:
             if (
                 owner is not None
                 and self._is_select_in_scalar_context(owner)
-                and not self._is_select_under_set_operation(owner)
             ):
                 scalar_select_ids.add(id(owner))
 
         def transform(node: exp.Expression) -> exp.Expression:
             if isinstance(node, exp.Window) and self._is_aggregate_like(node.this):
+                owner = self._nearest_select(node)
+                if owner is not None and id(owner) in scalar_select_ids:
+                    return node
                 return self._aggregate_argument(node.this)
             if self._is_aggregate_like(node):
+                owner = self._nearest_select(node)
+                if owner is not None and id(owner) in scalar_select_ids:
+                    return node
                 return self._aggregate_argument(node)
             return node
 
         stmt = stmt.transform(transform, copy=False)
         for select in stmt.find_all(exp.Select):
-            if select.args.get("group") is not None:
-                select.set("group", None)
             having = select.args.get("having")
-            if select.args.get("group") is None and isinstance(having, exp.Having) and isinstance(having.this, exp.Expression):
+            if (
+                select.args.get("group") is None
+                and isinstance(having, exp.Having)
+                and isinstance(having.this, exp.Expression)
+                and not self._expr_has_aggregate(having.this)
+            ):
                 where = select.args.get("where")
                 if isinstance(where, exp.Where) and isinstance(where.this, exp.Expression):
                     select.set("where", exp.Where(this=exp.And(this=where.this.copy(), expression=having.this.copy())))
@@ -562,8 +590,27 @@ class ApproximateMutator:
 
     def _normalize_all_joins_to_inner(self, stmt: exp.Expression) -> None:
         for join in stmt.find_all(exp.Join):
+            side = str(join.args.get("side") or "").upper()
+            on_expr = join.args.get("on")
+            # Keep LEFT/RIGHT join shape only when ON is a literal-true
+            # predicate (e.g. ON TRUE / ON 1=1).
+            if side in {"LEFT", "RIGHT"} and self._is_on_true_predicate(on_expr):
+                continue
             join.set("side", None)
             join.set("kind", "INNER")
+
+    def _is_on_true_predicate(self, cond: exp.Expression | None) -> bool:
+        node = self._unwrap_parens(cond)
+        if node is None:
+            return False
+        if isinstance(node, exp.Boolean):
+            return bool(node.this)
+        if isinstance(node, exp.EQ):
+            left = self._unwrap_parens(node.this)
+            right = self._unwrap_parens(node.expression)
+            if isinstance(left, exp.Literal) and isinstance(right, exp.Literal):
+                return left.this == right.this
+        return False
 
     def preprocess_statement(
         self,
@@ -1503,7 +1550,11 @@ class ApproximateMutator:
         parent = subquery.parent
         if isinstance(parent, exp.In) and subquery.arg_key == "query":
             return False
+        if isinstance(parent, (exp.Any, exp.All)) and subquery.arg_key == "this":
+            return False
         if isinstance(parent, exp.Exists) and subquery.arg_key == "this":
+            return False
+        if isinstance(parent, exp.SetOperation):
             return False
         if isinstance(parent, (exp.From, exp.Join, exp.CTE, exp.Lateral)):
             return False

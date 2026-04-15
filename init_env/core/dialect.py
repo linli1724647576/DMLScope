@@ -33,6 +33,7 @@ _DEFAULT_OPTIONS = {
     "supports_subdate": True,
     "supports_select_distinct": True,
     "supports_select_having": True,
+    "supports_having_select_alias_reference": False,
     "supports_insert_ignore": True,
     "supports_insert_by_name": False,
     "supports_dml_returning": False,
@@ -78,6 +79,7 @@ DIALECTS = {
         database="",
         options={
             "supports_replace_delayed": False,
+            "supports_having_select_alias_reference": True,
             "supports_window_functions": True,
             "supports_table_partitioning": True,
             "supports_dml_partition_clause": True,
@@ -93,6 +95,7 @@ DIALECTS = {
         options={
             "sqlglot_dialect": "mysql",
             "supports_dml_with": False,
+            "supports_having_select_alias_reference": True,
             "supports_replace_delayed": False,
             "supports_window_functions": True,
             "supports_table_partitioning": True,
@@ -108,6 +111,7 @@ DIALECTS = {
         database="",
         options={
             "sqlglot_dialect": "mysql",
+            "supports_having_select_alias_reference": True,
             "supports_update_low_priority": False,
             "supports_update_order_by_limit": False,
             "supports_delete_low_priority": False,
@@ -213,6 +217,7 @@ DIALECTS = {
         options={
             "sqlglot_dialect": "mysql",
             "supports_geometry": False,
+            "supports_having_select_alias_reference": True,
             "supports_update_low_priority": False,
             "supports_update_order_by_limit": False,
             "supports_delete_low_priority": False,
@@ -233,6 +238,7 @@ DIALECTS = {
         database="",
         options={
             "sqlglot_dialect": "mysql",
+            "supports_having_select_alias_reference": True,
             "supports_update_ignore": False,
             "supports_update_order_by_limit": False,
             "supports_delete_order_by_limit": False,
@@ -251,6 +257,7 @@ DIALECTS = {
         database="",
         options={
             "sqlglot_dialect": "mysql",
+            "supports_having_select_alias_reference": True,
             "supports_window_functions": True,
             "supports_table_partitioning": True,
             "supports_dml_partition_clause": True,

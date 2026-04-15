@@ -189,8 +189,6 @@ def replace_select(schema: dict, table_ids: dict, dialect: str) -> str:
         expr_types=expr_types,
         dialect=dialect,
     )
-    if source.limit is not None:
-        select_ast = select_ast.limit(source.limit, copy=False)
     if dialect_option(dialect, "supports_select_distinct", True) and random.random() < 0.25:
         select_ast.set("distinct", exp.Distinct())
 

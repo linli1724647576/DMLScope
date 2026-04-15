@@ -6,7 +6,7 @@ DMLScope is a DML fuzzing framework for generating original DML statements, muta
 
 ### Python
 
-Use Python 3.11 or newer. The project is pure Python, but several runtime drivers are required depending on the target database.
+Use Python 3.11 or newer (tested on Python 3.14.0). The project is pure Python, but several runtime drivers are required depending on the target database.
 
 Recommended setup on Windows PowerShell:
 
@@ -19,15 +19,21 @@ pip install sqlglot duckdb pymysql pymonetdb
 
 Minimum package guidance:
 
-- `sqlglot`: SQL parsing and rewriting
-- `duckdb`: required for the `duckdb` dialect
-- `pymysql`: required for MySQL-compatible dialects
-- `pymonetdb`: required for the `monetdb` dialect
+- `sqlglot>=28.1.0,<29`: SQL parsing and rewriting (tested with `28.1.0`)
+- `duckdb>=1.5.0,<2`: required for the `duckdb` dialect (tested with `1.5.0`)
+- `PyMySQL>=1.1.2,<2`: required for MySQL-compatible dialects (tested with `1.1.2`)
+- `pymonetdb>=1.9.0,<2`: required for the `monetdb` dialect (tested with `1.9.0`)
+
+Pinned install command (recommended for reproducibility):
+
+```powershell
+pip install "sqlglot>=28.1.0,<29" "duckdb>=1.5.0,<2" "PyMySQL>=1.1.2,<2" "pymonetdb>=1.9.0,<2"
+```
 
 If you only plan to run DuckDB locally, this is sufficient:
 
 ```powershell
-pip install sqlglot duckdb
+pip install "sqlglot>=28.1.0,<29" "duckdb>=1.5.0,<2"
 ```
 
 ### Database Backends
@@ -39,7 +45,7 @@ DuckDB is the easiest backend to run because it uses a local database file and d
 No extra infrastructure is needed beyond the Python package:
 
 ```powershell
-pip install duckdb
+pip install "duckdb>=1.5.0,<2"
 ```
 
 #### MySQL-Compatible Dialects
