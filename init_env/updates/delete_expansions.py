@@ -24,6 +24,8 @@ from init_env.updates.delete_tests import test_delete_variant
 SETOP_DERIVED_FROM_PROB = 0.6
 SUBQUERY_DERIVED_FROM_PROB = 0.3
 SETOP_COMBINE_PROB = 0.7
+SETOP_GROUP_PROB = 0.18
+SETOP_HAVING_PROB = 0.18
 SETOP_WHERE_STRATEGY_PROB = 0.85
 JOIN_DERIVED_SETOP_PROB = 0.6
 DELETE_MULTI_SELECT_FILTER_PROB = 0.75
@@ -223,6 +225,7 @@ def _render_delete_ast(
         stmt.set("this", _parse_delete_source(source_sql, dialect))
     if using_sql:
         stmt.set("using", _parse_delete_using(using_sql, dialect))
+    _inject_random_having_on_selects(stmt, dialect, prob=SETOP_HAVING_PROB)
     rendered = _normalize_monetdb_sql(
         _restore_mysql_regexp_like(stmt.sql(dialect=_sqlglot_dialect(dialect))),
         dialect,
@@ -1043,27 +1046,130 @@ def _data_type_ast(type_sql: str, dialect: str) -> exp.DataType:
     return parsed
 
 
-def _build_args_ast(schema: dict, table: str, spec: dict, table_alias: str | None = None, dialect: str = "mysql") -> list[exp.Expression]:
-    count = _variadic_arg_count(spec)
+def _normalize_function_type(type_tag: str | None) -> str:
+    tag = (type_tag or "any").strip().lower()
+    if tag in {"int", "integer", "bigint", "smallint", "tinyint", "double", "float", "real", "decimal", "number", "numeric"}:
+        return "numeric"
+    if tag in {"char", "varchar", "text", "string"}:
+        return "string"
+    if tag in {"timestamp", "datetime"}:
+        return "datetime"
+    if tag in {"date"}:
+        return "date"
+    if tag in {"time"}:
+        return "time"
+    if tag in {"json"}:
+        return "json"
+    if tag in {"bool", "boolean"}:
+        return "boolean"
+    if tag in {"binary", "blob", "varbinary"}:
+        return "binary"
+    if tag in {"any"}:
+        return "any"
+    return "any"
+
+
+def _function_arg_type(spec: dict, arg_index: int, desired_type: str | None = None) -> str:
+    name = spec["name"]
+    desired = _normalize_function_type(desired_type)
+    if name == "IF":
+        return "boolean" if arg_index == 0 else desired
+    if name in {"IFNULL", "NULLIF", "MIN", "MAX"}:
+        return desired
+
     arg_types = spec.get("arg_types") or ["any"]
+    type_tag = arg_types[arg_index] if arg_index < len(arg_types) else arg_types[-1]
+    return _normalize_function_type(type_tag)
+
+
+def _pick_col_for_function_arg(schema: dict, table: str, type_tag: str) -> str | None:
+    tag = _normalize_function_type(type_tag)
+    if tag == "date":
+        return _pick_col_by_tag(schema, table, "date") or _pick_col_by_tag(schema, table, "datetime")
+    if tag == "datetime":
+        return _pick_col_by_tag(schema, table, "datetime") or _pick_col_by_tag(schema, table, "date")
+    if tag in {"numeric", "string", "time", "json", "boolean", "binary"}:
+        return _pick_col_by_tag(schema, table, tag)
+    return None
+
+
+def _safe_any_function_type(schema: dict, table: str) -> str:
+    candidates = [t for t in available_general_type_tags(schema, table) if t in {"numeric", "string", "date", "datetime"}]
+    if not candidates:
+        return random.choice(["numeric", "string"])
+    return random.choice(candidates)
+
+
+def _cast_type_sql_for_desired(desired_type: str, dialect: str) -> str:
+    desired = _normalize_function_type(desired_type)
+    if desired == "numeric":
+        return random.choice(["DECIMAL(10,2)", "DOUBLE", "BIGINT"])
+    if desired == "string":
+        return random.choice(["VARCHAR(32)", "CHAR(16)"])
+    if desired == "date":
+        return "DATE"
+    if desired == "datetime":
+        return "TIMESTAMP" if dialect in {"duckdb", "monetdb"} else "DATETIME"
+    if desired == "time":
+        return "TIME"
+    if desired == "boolean":
+        return "BOOLEAN"
+    return "VARCHAR(32)"
+
+
+def _cast_source_expr_for_target(
+    schema: dict,
+    table: str,
+    cast_type_sql: str,
+    table_alias: str | None = None,
+) -> exp.Expression:
+    target = cast_type_sql.strip().lower().split("(", 1)[0]
+    if target in {"date"}:
+        if random.random() < 0.65:
+            return _simple_expr_ast(schema, table, random.choice(["date", "datetime"]), table_alias=table_alias)
+        return exp.Literal.string(rand_date())
+    if target in {"datetime", "timestamp"}:
+        if random.random() < 0.65:
+            return _simple_expr_ast(schema, table, random.choice(["datetime", "date"]), table_alias=table_alias)
+        return exp.Literal.string(rand_datetime())
+    if target in {"time"}:
+        if random.random() < 0.65:
+            return _simple_expr_ast(schema, table, "time", table_alias=table_alias)
+        return exp.Literal.string(rand_time())
+    if target in {"boolean", "bool"}:
+        return _simple_expr_ast(schema, table, "boolean", table_alias=table_alias)
+    if target in {"int", "integer", "bigint", "smallint", "tinyint", "double", "float", "real", "decimal", "numeric"}:
+        return _simple_expr_ast(schema, table, "numeric", table_alias=table_alias)
+    if target in {"char", "varchar", "text", "string"}:
+        return _simple_expr_ast(schema, table, "string", table_alias=table_alias)
+    return _simple_expr_ast(schema, table, random.choice(["numeric", "string", "date", "datetime"]), table_alias=table_alias)
+
+
+def _build_args_ast(
+    schema: dict,
+    table: str,
+    spec: dict,
+    table_alias: str | None = None,
+    dialect: str = "mysql",
+    desired_type: str | None = None,
+) -> list[exp.Expression]:
+    count = _variadic_arg_count(spec, dialect)
     args: list[exp.Expression] = []
     for i in range(count):
-        type_tag = arg_types[i] if i < len(arg_types) else arg_types[-1]
+        type_tag = _function_arg_type(spec, i, desired_type=desired_type)
         if type_tag == "any":
-            node = _qualify_col_ast(_pick_any_col(schema, table), table, table_alias)
-            args.append(node if node is not None else _literal_ast(random.choice(["string", "numeric"])))
+            type_tag = _safe_any_function_type(schema, table)
+        col = _pick_col_for_function_arg(schema, table, type_tag)
+        if col and random.random() < 0.7:
+            node = _qualify_col_ast(col, table, table_alias)
+            args.append(node if node is not None else _literal_ast(type_tag))
         else:
-            col = _pick_aggregate_numeric_col(schema, table, dialect) if type_tag == "numeric" else _pick_col_for_type(schema, table, type_tag)
-            if col and random.random() < 0.7:
-                node = _qualify_col_ast(col, table, table_alias)
-                args.append(node if node is not None else _literal_ast(type_tag))
-            else:
-                args.append(_literal_ast(type_tag))
+            args.append(_literal_ast(type_tag))
     return args
 
 
 def _string_expr_ast(schema: dict, table: str, table_alias: str | None = None) -> exp.Expression:
-    col = _pick_string_col(schema, table)
+    col = _pick_col_for_function_arg(schema, table, "string")
     if col and random.random() < 0.8:
         node = _qualify_col_ast(col, table, table_alias)
         if node is not None:
@@ -1072,17 +1178,18 @@ def _string_expr_ast(schema: dict, table: str, table_alias: str | None = None) -
 
 
 def _any_expr_ast(schema: dict, table: str, table_alias: str | None = None) -> exp.Expression:
-    col = _pick_any_col(schema, table)
+    type_tag = _safe_any_function_type(schema, table)
+    col = _pick_col_for_function_arg(schema, table, type_tag)
     if col and random.random() < 0.7:
         node = _qualify_col_ast(col, table, table_alias)
         if node is not None:
             return node
-    return _literal_ast(random.choice(["string", "numeric"]))
+    return _literal_ast(type_tag)
 
 
 def _simple_expr_ast(schema: dict, table: str, type_tag: str, table_alias: str | None = None) -> exp.Expression:
     if type_tag == "numeric":
-        col = _pick_numeric_col(schema, table)
+        col = _pick_col_for_function_arg(schema, table, "numeric")
         if col and random.random() < 0.7:
             node = _qualify_col_ast(col, table, table_alias)
             if node is not None:
@@ -1096,21 +1203,21 @@ def _simple_expr_ast(schema: dict, table: str, type_tag: str, table_alias: str |
                 return node
         return _literal_ast("boolean")
     if type_tag == "string":
-        col = _pick_string_col(schema, table)
+        col = _pick_col_for_function_arg(schema, table, "string")
         if col and random.random() < 0.7:
             node = _qualify_col_ast(col, table, table_alias)
             if node is not None:
                 return node
         return _literal_ast("string")
     if type_tag == "date":
-        col = _pick_date_col(schema, table)
+        col = _pick_col_for_function_arg(schema, table, "date")
         if col and random.random() < 0.7:
             node = _qualify_col_ast(col, table, table_alias)
             if node is not None:
                 return node
         return _literal_ast("date")
     if type_tag == "datetime":
-        col = _pick_datetime_col(schema, table)
+        col = _pick_col_for_function_arg(schema, table, "datetime")
         if col and random.random() < 0.7:
             node = _qualify_col_ast(col, table, table_alias)
             if node is not None:
@@ -1119,7 +1226,7 @@ def _simple_expr_ast(schema: dict, table: str, type_tag: str, table_alias: str |
     if type_tag == "time":
         return _literal_ast("time")
     if type_tag == "json":
-        col = _pick_json_col(schema, table)
+        col = _pick_col_for_function_arg(schema, table, "json")
         if col and random.random() < 0.7:
             node = _qualify_col_ast(col, table, table_alias)
             if node is not None:
@@ -1171,11 +1278,20 @@ def _function_expr_ast(
     allow_aggregate: bool = True,
     table_alias: str | None = None,
 ) -> exp.Expression:
-    category = None if allow_aggregate else "scalar"
-    spec = _pick_function_spec(desired_type, dialect, category=category)
+    if allow_aggregate:
+        spec = _pick_function_spec(desired_type, dialect, category=None)
+    else:
+        scalar_candidates = [
+            f
+            for f in FUNCTION_SPECS
+            if f.get("category") == "scalar"
+            and _function_supported(f["name"], dialect)
+            and _function_return_matches(f, desired_type)
+        ]
+        if not scalar_candidates:
+            return _simple_expr_ast(schema, table, desired_type, table_alias=table_alias)
+        spec = random.choice(scalar_candidates)
     name = spec["name"]
-    if not allow_aggregate and spec.get("category") == "aggregate":
-        return _simple_expr_ast(schema, table, desired_type, table_alias=table_alias)
     if name in ("MIN", "MAX"):
         arg = _simple_expr_ast(schema, table, desired_type, table_alias=table_alias)
         klass = exp.Min if name == "MIN" else exp.Max
@@ -1185,13 +1301,18 @@ def _function_expr_ast(
         distinct = exp.Distinct(expressions=[arg])
         return exp.Count(this=distinct) if name == "COUNT_DISTINCT" else exp.Sum(this=distinct)
     if name == "CAST":
-        cast_type = random.choice(["CHAR(10)", "SIGNED", "DECIMAL(10,2)", "DATE", "DATETIME"])
-        source_type = "string" if cast_type.startswith("CHAR") else ("datetime" if cast_type in ("DATE", "DATETIME") else "numeric")
-        return exp.Cast(this=_simple_expr_ast(schema, table, source_type, table_alias=table_alias), to=_data_type_ast(cast_type, dialect))
+        cast_type = _cast_type_sql_for_desired(desired_type, dialect)
+        return exp.Cast(
+            this=_cast_source_expr_for_target(schema, table, cast_type, table_alias=table_alias),
+            to=_data_type_ast(cast_type, dialect),
+        )
     if name == "CONVERT":
-        cast_type = random.choice(["CHAR(10)", "SIGNED", "DECIMAL(10,2)", "DATE", "DATETIME"])
-        source_type = "string" if cast_type.startswith("CHAR") else ("datetime" if cast_type in ("DATE", "DATETIME") else "numeric")
-        return exp.Convert(this=_simple_expr_ast(schema, table, source_type, table_alias=table_alias), expression=_data_type_ast(cast_type, dialect))
+        cast_type = _cast_type_sql_for_desired(desired_type, dialect)
+        # sqlglot renders exp.Convert as CAST(type AS expr) in mysql dialect.
+        return exp.Cast(
+            this=_cast_source_expr_for_target(schema, table, cast_type, table_alias=table_alias),
+            to=_data_type_ast(cast_type, dialect),
+        )
     if name == "DIV":
         left = _simple_expr_ast(schema, table, "numeric", table_alias=table_alias)
         right = _simple_expr_ast(schema, table, "numeric", table_alias=table_alias)
@@ -1275,7 +1396,17 @@ def _function_expr_ast(
         return exp.Anonymous(this=name, expressions=parts)
     if name == "JSON_ARRAY":
         return exp.Anonymous(this="JSON_ARRAY", expressions=[_any_expr_ast(schema, table, table_alias=table_alias) for _ in range(random.randint(0, 4))])
-    return exp.Anonymous(this=name, expressions=_build_args_ast(schema, table, spec, table_alias=table_alias, dialect=dialect))
+    return exp.Anonymous(
+        this=name,
+        expressions=_build_args_ast(
+            schema,
+            table,
+            spec,
+            table_alias=table_alias,
+            dialect=dialect,
+            desired_type=desired_type,
+        ),
+    )
 
 
 def _expr_for_type_ast(schema: dict, table: str, dialect: str, type_tag: str, allow_aggregate: bool = True, table_alias: str | None = None) -> exp.Expression:
@@ -1293,6 +1424,60 @@ def _expr_for_type_ast(schema: dict, table: str, dialect: str, type_tag: str, al
 
 def _cmp_ast(op: str, left: exp.Expression, right: exp.Expression) -> exp.Expression:
     return {"=": exp.EQ, "<>": exp.NEQ, ">": exp.GT, "<": exp.LT, ">=": exp.GTE, "<=": exp.LTE}[op](this=left, expression=right)
+
+
+def _expr_contains_interval(node: exp.Expression | None) -> bool:
+    if node is None:
+        return False
+    if isinstance(node, exp.Interval):
+        return True
+    return any(_expr_contains_interval(child) for child in node.iter_expressions())
+
+
+def _infer_condition_expr_type_tag(node: exp.Expression | None) -> str | None:
+    if node is None:
+        return None
+    if isinstance(node, exp.Alias):
+        return _infer_condition_expr_type_tag(node.this)
+    if isinstance(node, exp.Paren):
+        return _infer_condition_expr_type_tag(node.this)
+    if isinstance(node, exp.Cast):
+        cast_to = node.args.get("to")
+        if isinstance(cast_to, exp.DataType):
+            return _type_tag_for_col_type(cast_to.sql(dialect="mysql"))
+    if isinstance(node, exp.Literal):
+        return "string" if node.is_string else "numeric"
+    if isinstance(node, exp.Interval):
+        return "datetime"
+    if isinstance(node, (exp.DateAdd, exp.DateSub)):
+        return "datetime"
+    if isinstance(node, (exp.Count, exp.Sum, exp.Avg)):
+        return "numeric"
+    if isinstance(node, (exp.Min, exp.Max)):
+        return _infer_condition_expr_type_tag(node.this)
+    if isinstance(node, (exp.Add, exp.Sub)):
+        if _expr_contains_interval(node.this) or _expr_contains_interval(node.expression):
+            return "datetime"
+        return "numeric"
+    if isinstance(node, (exp.Mul, exp.Div, exp.Mod)):
+        return "numeric"
+    cls = node.__class__.__name__.lower()
+    if cls in {"lower", "upper", "concat", "substr", "substring", "trim"}:
+        return "string"
+    if cls in {"year", "month", "day", "hour", "minute", "second", "datediff", "timestampdiff", "length", "charlength"}:
+        return "numeric"
+    if cls in {"currentdate", "date"}:
+        return "date"
+    if cls in {"currenttimestamp", "timestamp", "now"}:
+        return "datetime"
+    return None
+
+
+def _effective_predicate_type_tag(left: exp.Expression, fallback_type_tag: str) -> str:
+    inferred = _infer_condition_expr_type_tag(left)
+    if inferred in {"numeric", "string", "date", "datetime", "time", "boolean"}:
+        return inferred
+    return fallback_type_tag
 
 
 def _function_supported(name: str, dialect: str) -> bool:
@@ -1337,62 +1522,62 @@ def _function_supported(name: str, dialect: str) -> bool:
     return True
 
 
+def _function_return_matches(spec: dict, desired_type: str) -> bool:
+    desired = _normalize_function_type(desired_type)
+    if desired == "any":
+        return True
+    if desired == "json":
+        return _normalize_function_type(spec.get("return_type")) == "json"
+
+    name = spec["name"]
+    if name in {"MIN", "MAX", "CAST", "CONVERT", "IF", "IFNULL", "NULLIF"}:
+        return desired in {"numeric", "string", "date", "datetime", "time", "json", "boolean"}
+
+    ret_type = _normalize_function_type(spec.get("return_type"))
+    if ret_type == "any":
+        return desired in {"numeric", "string", "date", "datetime", "time", "json", "boolean"}
+    return ret_type == desired
+
+
 def _pick_function_spec(desired_type: str, dialect: str, category: str | None = None) -> dict:
-    if desired_type == "numeric":
-        candidates = [
-            f
-            for f in FUNCTION_SPECS
-            if f["return_type"] in ("numeric", "INT", "DOUBLE")
-            or f["name"] in ("MIN", "MAX")
-        ]
-    elif desired_type == "string":
-        candidates = [
-            f for f in FUNCTION_SPECS if f["return_type"] in ("string",) or f["name"] in ("MIN", "MAX")
-        ]
-    elif desired_type == "date":
-        candidates = [
-            f
-            for f in FUNCTION_SPECS
-            if f["return_type"] == "date" or f["name"] in ("MIN", "MAX")
-        ]
-    elif desired_type == "datetime":
-        candidates = [
-            f
-            for f in FUNCTION_SPECS
-            if f["return_type"] == "datetime" or f["name"] in ("MIN", "MAX")
-        ]
-    elif desired_type == "time":
-        candidates = [
-            f
-            for f in FUNCTION_SPECS
-            if f["return_type"] == "time" or f["name"] in ("MIN", "MAX")
-        ]
-    elif desired_type == "json":
-        candidates = [f for f in FUNCTION_SPECS if f["return_type"] == "json"]
-    else:
-        candidates = [f for f in FUNCTION_SPECS]
-
-    if desired_type != "json":
-        candidates = [f for f in candidates if not f["name"].startswith("JSON_")]
-
-    candidates = [f for f in candidates if _function_supported(f["name"], dialect)]
-
-    if category is not None:
-        candidates = [f for f in candidates if f.get("category") == category]
+    normalized_desired = _normalize_function_type(desired_type)
+    candidates: list[dict] = []
+    for spec in FUNCTION_SPECS:
+        name = spec["name"]
+        if category is not None and spec.get("category") != category:
+            continue
+        if not _function_supported(name, dialect):
+            continue
+        if normalized_desired != "json" and name.startswith("JSON_"):
+            continue
+        if not _function_return_matches(spec, normalized_desired):
+            continue
+        candidates.append(spec)
 
     if not candidates:
-        if category is not None:
-            candidates = [
-                f for f in FUNCTION_SPECS if f.get("category") == category and _function_supported(f["name"], dialect)
-            ]
-        else:
-            candidates = [f for f in FUNCTION_SPECS if _function_supported(f["name"], dialect)] or FUNCTION_SPECS
+        fallback_names = {"MIN", "MAX", "CAST", "CONVERT", "IF", "IFNULL", "NULLIF"}
+        candidates = [
+            f
+            for f in FUNCTION_SPECS
+            if (category is None or f.get("category") == category)
+            and _function_supported(f["name"], dialect)
+            and f["name"] in fallback_names
+        ]
+    if not candidates:
+        candidates = [
+            f
+            for f in FUNCTION_SPECS
+            if (category is None or f.get("category") == category)
+            and _function_supported(f["name"], dialect)
+        ] or FUNCTION_SPECS
     return random.choice(candidates)
 
 
-def _variadic_arg_count(spec: dict) -> int:
+def _variadic_arg_count(spec: dict, dialect: str = "mysql") -> int:
     min_args = spec["min_args"]
     max_args = spec["max_args"]
+    if spec["name"] == "ATAN" and dialect == "duckdb":
+        return 1
     if max_args is not None:
         return random.randint(min_args, max_args)
 
@@ -1408,8 +1593,25 @@ def _variadic_arg_count(spec: dict) -> int:
     return random.randint(min_args, min_args + 3)
 
 
-def _build_args(schema: dict, table: str, spec: dict, table_alias: str | None = None) -> list:
-    return [_expr_sql(arg, "mysql") for arg in _build_args_ast(schema, table, spec, table_alias=table_alias, dialect="mysql")]
+def _build_args(
+    schema: dict,
+    table: str,
+    spec: dict,
+    table_alias: str | None = None,
+    dialect: str = "mysql",
+    desired_type: str | None = None,
+) -> list:
+    return [
+        _expr_sql(arg, dialect)
+        for arg in _build_args_ast(
+            schema,
+            table,
+            spec,
+            table_alias=table_alias,
+            dialect=dialect,
+            desired_type=desired_type,
+        )
+    ]
 
 
 def _string_expr(schema: dict, table: str, table_alias: str | None = None) -> str:
@@ -1474,10 +1676,10 @@ def _build_condition_ast(
     allow_subqueries: bool = True,
     protected_tables: set[str] | None = None,
     table_alias: str | None = None,
-    depth: int = 0,
+    leaf_budget: int = 3,
+    logic_depth: int = 0,
 ) -> exp.Expression:
-    max_depth = 2
-    if depth < max_depth:
+    if leaf_budget > 1 and logic_depth < 3:
         roll = random.random()
         if roll < COND_NOT_PROB:
             return exp.Not(
@@ -1489,10 +1691,12 @@ def _build_condition_ast(
                     allow_subqueries=allow_subqueries,
                     protected_tables=protected_tables,
                     table_alias=table_alias,
-                    depth=depth + 1,
+                    leaf_budget=leaf_budget,
+                    logic_depth=logic_depth + 1,
                 )
             )
         if roll < COND_NOT_PROB + COND_AND_PROB:
+            left_budget, right_budget = _split_logic_leaf_budget(leaf_budget)
             return exp.And(
                 this=_build_condition_ast(
                     schema,
@@ -1502,7 +1706,8 @@ def _build_condition_ast(
                     allow_subqueries=allow_subqueries,
                     protected_tables=protected_tables,
                     table_alias=table_alias,
-                    depth=depth + 1,
+                    leaf_budget=left_budget,
+                    logic_depth=logic_depth + 1,
                 ),
                 expression=_build_condition_ast(
                     schema,
@@ -1512,10 +1717,12 @@ def _build_condition_ast(
                     allow_subqueries=allow_subqueries,
                     protected_tables=protected_tables,
                     table_alias=table_alias,
-                    depth=depth + 1,
+                    leaf_budget=right_budget,
+                    logic_depth=logic_depth + 1,
                 ),
             )
         if roll < COND_NOT_PROB + COND_AND_PROB + COND_OR_PROB:
+            left_budget, right_budget = _split_logic_leaf_budget(leaf_budget)
             return exp.Or(
                 this=_build_condition_ast(
                     schema,
@@ -1525,7 +1732,8 @@ def _build_condition_ast(
                     allow_subqueries=allow_subqueries,
                     protected_tables=protected_tables,
                     table_alias=table_alias,
-                    depth=depth + 1,
+                    leaf_budget=left_budget,
+                    logic_depth=logic_depth + 1,
                 ),
                 expression=_build_condition_ast(
                     schema,
@@ -1535,7 +1743,8 @@ def _build_condition_ast(
                     allow_subqueries=allow_subqueries,
                     protected_tables=protected_tables,
                     table_alias=table_alias,
-                    depth=depth + 1,
+                    leaf_budget=right_budget,
+                    logic_depth=logic_depth + 1,
                 ),
             )
 
@@ -1684,27 +1893,35 @@ def _predicate_value_leaf_ast(
     table_alias = table_alias or table
 
     left = _expr_for_type_ast(schema, table, dialect, type_tag, allow_aggregate=False, table_alias=table_alias)
+    effective_type_tag = _effective_predicate_type_tag(left, type_tag)
     if op == "IS":
         return exp.Is(this=left, expression=exp.Null())
     if op == "IS NOT":
         return exp.Not(this=exp.Is(this=left, expression=exp.Null()))
     if op == "BETWEEN":
-        return exp.Between(this=left, low=_literal_ast(type_tag), high=_literal_ast(type_tag))
+        return exp.Between(this=left, low=_literal_ast(effective_type_tag), high=_literal_ast(effective_type_tag))
     if op == "IN":
         return _predicate_in_ast(
             schema,
             table,
             table_ids,
             dialect,
-            type_tag,
+            effective_type_tag,
             left,
             protected_tables=protected_tables,
         )
-    if op == "LIKE":
+    if op == "LIKE" and effective_type_tag == "string":
         return exp.Like(this=left, expression=_pattern_literal_ast("LIKE"))
-    if op == "REGEXP":
+    if op == "REGEXP" and effective_type_tag == "string":
         return exp.RegexpLike(this=left, expression=_pattern_literal_ast("REGEXP"))
-    right = _expr_for_type_ast(schema, table, dialect, type_tag, allow_aggregate=False, table_alias=table_alias)
+    right = _expr_for_type_ast(
+        schema,
+        table,
+        dialect,
+        effective_type_tag,
+        allow_aggregate=False,
+        table_alias=table_alias,
+    )
     return _cmp_ast(op, left, right)
 
 
@@ -1870,6 +2087,10 @@ def _setop_projection(items: list[str]) -> str:
     return ", ".join(cols)
 
 
+def _setop_projection_aliases(column_count: int) -> list[str]:
+    return ["k" if i == 1 else f"k{i}" for i in range(1, column_count + 1)]
+
+
 def _expr_has_column_ref(expr_sql: str, dialect: str) -> bool:
     try:
         node = sqlglot.parse_one(expr_sql, read=_sqlglot_dialect(dialect))
@@ -1878,13 +2099,182 @@ def _expr_has_column_ref(expr_sql: str, dialect: str) -> bool:
     return any(True for _ in node.find_all(exp.Column))
 
 
-def _having_clause_for_grouped_exprs(exprs: list[str], type_tag: str, dialect: str) -> str:
-    probes = [sqlglot.parse_one(expr, read=_sqlglot_dialect("mysql")) for expr in exprs]
+def _split_logic_leaf_budget(total_leaves: int) -> tuple[int, int]:
+    if total_leaves <= 2:
+        return 1, max(1, total_leaves - 1)
+    left = random.randint(1, total_leaves - 1)
+    return left, total_leaves - left
+
+
+def _collect_setop_group_columns(node: exp.Expression | None) -> list[exp.Column]:
+    if node is None:
+        return []
+    # Nested subqueries have independent scopes; do not pull their table aliases
+    # into the current SELECT's GROUP BY columns.
+    if isinstance(node, (exp.Subquery, exp.Select, exp.CTE)):
+        return []
+    if isinstance(node, exp.Window) and isinstance(node.this, exp.AggFunc):
+        return []
+    if isinstance(node, exp.AggFunc):
+        return []
+    if isinstance(node, exp.Column):
+        return [node.copy()]
+    cols: list[exp.Column] = []
+    for value in node.args.values():
+        if isinstance(value, exp.Expression):
+            if isinstance(value, (exp.Subquery, exp.Select, exp.CTE)):
+                continue
+            cols.extend(_collect_setop_group_columns(value))
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, exp.Expression):
+                    if isinstance(item, (exp.Subquery, exp.Select, exp.CTE)):
+                        continue
+                    cols.extend(_collect_setop_group_columns(item))
+    return cols
+
+
+def _collect_setop_group_items(exprs: list[str], dialect: str) -> list[str]:
+    seen: set[str] = set()
+    group_items: list[str] = []
+    for expr_sql in exprs:
+        try:
+            node = sqlglot.parse_one(expr_sql, read=_sqlglot_dialect(dialect))
+        except Exception:
+            continue
+        for col in _collect_setop_group_columns(node):
+            key = col.sql(dialect=_sqlglot_dialect(dialect))
+            if key in seen:
+                continue
+            seen.add(key)
+            group_items.append(key)
+    return group_items
+
+
+def _setop_expr_has_aggregate(node: exp.Expression | None) -> bool:
+    if node is None:
+        return False
+    if isinstance(node, exp.Window) and isinstance(node.this, exp.AggFunc):
+        return True
+    if isinstance(node, exp.AggFunc):
+        return True
+    return any(_setop_expr_has_aggregate(child) for child in node.iter_expressions())
+
+
+def _setop_sqls_have_aggregate(exprs: list[str], dialect: str) -> bool:
+    for expr_sql in exprs:
+        try:
+            node = sqlglot.parse_one(expr_sql, read=_sqlglot_dialect(dialect))
+        except Exception:
+            continue
+        if _setop_expr_has_aggregate(node):
+            return True
+    return False
+
+
+def _infer_setop_expr_type_tag(node: exp.Expression | None) -> str | None:
+    if node is None:
+        return None
+    if isinstance(node, exp.Alias):
+        return _infer_setop_expr_type_tag(node.this)
+    if isinstance(node, exp.Paren):
+        return _infer_setop_expr_type_tag(node.this)
+    if isinstance(node, exp.Cast):
+        cast_to = node.args.get("to")
+        if isinstance(cast_to, exp.DataType):
+            cast_type_tag = _type_tag_for_col_type(cast_to.sql(dialect="mysql"))
+            if cast_type_tag in {"numeric", "string", "date", "datetime"}:
+                return cast_type_tag
+    if isinstance(node, exp.Literal):
+        return "string" if node.is_string else "numeric"
+    if isinstance(node, (exp.Count, exp.Sum, exp.Avg)):
+        return "numeric"
+    if isinstance(node, (exp.Min, exp.Max)):
+        return _infer_setop_expr_type_tag(node.this)
+    if isinstance(node, (exp.Add, exp.Sub)):
+        if _expr_contains_interval(node.this) or _expr_contains_interval(node.expression):
+            return "datetime"
+        return "numeric"
+    if isinstance(node, (exp.Mul, exp.Div, exp.Mod)):
+        return "numeric"
+    if isinstance(node, exp.Anonymous):
+        name = (node.name or "").upper()
+        if name in {"COUNT", "SUM", "AVG", "LENGTH", "CHAR_LENGTH", "DATEDIFF", "TIMESTAMPDIFF"}:
+            return "numeric"
+        if name in {"LOWER", "UPPER", "CONCAT", "SUBSTR", "SUBSTRING", "TRIM"}:
+            return "string"
+        if name in {"DATE", "CURDATE", "CURRENT_DATE"}:
+            return "date"
+        if name in {"NOW", "CURRENT_TIMESTAMP", "SYSDATE"}:
+            return "datetime"
+    cls = node.__class__.__name__.lower()
+    if cls in {"lower", "upper", "concat", "substr", "substring", "trim"}:
+        return "string"
+    if cls in {"length", "charlength", "datediff", "timestampdiff", "year", "month", "day", "hour", "minute", "second"}:
+        return "numeric"
+    if cls in {"currentdate", "date"}:
+        return "date"
+    if cls in {"currenttimestamp", "timestamp", "now"}:
+        return "datetime"
+    return None
+
+
+def _infer_setop_expr_sql_type_tag(expr_sql: str, dialect: str) -> str | None:
+    try:
+        node = sqlglot.parse_one(expr_sql, read=_sqlglot_dialect(dialect))
+    except Exception:
+        return None
+    return _infer_setop_expr_type_tag(node)
+
+
+def _pick_having_type_and_exprs(
+    expr_sqls: list[str],
+    dialect: str,
+    *,
+    preferred_type: str | None = None,
+) -> tuple[list[str], str, bool]:
+    buckets: dict[str, list[str]] = {"numeric": [], "string": [], "date": [], "datetime": []}
+    for expr_sql in expr_sqls:
+        tag = _infer_setop_expr_sql_type_tag(expr_sql, dialect)
+        if tag in buckets:
+            buckets[tag].append(expr_sql)
+    if preferred_type in buckets and buckets[preferred_type]:
+        return buckets[preferred_type], preferred_type, True
+    candidates = [tag for tag, items in buckets.items() if items]
+    if candidates:
+        chosen = random.choice(candidates)
+        return buckets[chosen], chosen, True
+    return expr_sqls or ["1"], "numeric", False
+
+
+def _fallback_having_expr() -> exp.Expression:
+    return _cmp_ast(
+        random.choice(["=", "<>", ">", "<", ">=", "<="]),
+        exp.Count(this=exp.Star()),
+        exp.Literal.number(random.randint(0, 1000)),
+    )
+
+
+def _having_clause_for_grouped_exprs(
+    exprs: list[str],
+    type_tag: str,
+    dialect: str,
+    *,
+    allow_plain_probe: bool,
+    plain_probe_exprs: list[str] | None = None,
+) -> str:
+    probe_read_dialect = dialect if dialect.lower().strip() in {"duckdb", "monetdb"} else "mysql"
+    probes = [sqlglot.parse_one(expr, read=_sqlglot_dialect(probe_read_dialect)) for expr in exprs]
+    plain_probes = [
+        sqlglot.parse_one(expr, read=_sqlglot_dialect(probe_read_dialect))
+        for expr in (plain_probe_exprs or exprs)
+    ]
     monetdb_safe = dialect.lower().strip() == "monetdb"
 
     def having_operand() -> exp.Expression:
         probe = random.choice(probes).copy()
-        options: list[exp.Expression] = [] if monetdb_safe else [probe]
+        plain_probe = random.choice(plain_probes).copy()
+        options: list[exp.Expression] = [plain_probe] if allow_plain_probe and not monetdb_safe else []
         if type_tag in {"numeric", "string", "date", "datetime"}:
             options.extend([exp.Min(this=probe.copy()), exp.Max(this=probe.copy())])
         if type_tag == "numeric":
@@ -1895,8 +2285,21 @@ def _having_clause_for_grouped_exprs(exprs: list[str], type_tag: str, dialect: s
                 exp.Count(this=probe.copy()),
                 exp.Count(this=exp.Distinct(expressions=[probe.copy()])),
             ])
-        if not options:
-            options.append(exp.Count(this=exp.Star()))
+        return random.choice(options)
+
+    def aggregate_having_operand() -> exp.Expression:
+        probe = random.choice(probes).copy()
+        options: list[exp.Expression] = [
+            exp.Min(this=probe.copy()),
+            exp.Max(this=probe.copy()),
+        ]
+        if type_tag == "numeric":
+            options.extend([
+                exp.Sum(this=probe.copy()),
+                exp.Avg(this=probe.copy()),
+                exp.Count(this=probe.copy()),
+                exp.Count(this=exp.Distinct(expressions=[probe.copy()])),
+            ])
         return random.choice(options)
 
     def having_leaf() -> exp.Expression:
@@ -1907,7 +2310,8 @@ def _having_clause_for_grouped_exprs(exprs: list[str], type_tag: str, dialect: s
             )
         else:
             op = random.choice(["=", "<>", ">", "<", ">=", "<=", "BETWEEN", "IS", "IS NOT"])
-        left = having_operand()
+        literal_compare = op in {"=", "<>", ">", "<", ">=", "<="} and random.random() < 0.35
+        left = aggregate_having_operand() if literal_compare else having_operand()
         if op == "IS":
             return exp.Is(this=left, expression=exp.Null())
         if op == "IS NOT":
@@ -1918,20 +2322,143 @@ def _having_clause_for_grouped_exprs(exprs: list[str], type_tag: str, dialect: s
             return exp.Like(this=left, expression=_pattern_literal_ast("LIKE"))
         if op == "REGEXP":
             return exp.RegexpLike(this=left, expression=_pattern_literal_ast("REGEXP"))
-        return _cmp_ast(op, left, having_operand())
+        return _cmp_ast(op, left, _literal_ast(type_tag) if literal_compare else having_operand())
 
-    def having_predicate(depth: int = 0) -> exp.Expression:
-        if depth < 2:
-            roll = random.random()
-            if roll < COND_NOT_PROB:
-                return exp.Not(this=having_predicate(depth + 1))
-            if roll < COND_NOT_PROB + COND_AND_PROB:
-                return exp.And(this=having_predicate(depth + 1), expression=having_predicate(depth + 1))
-            if roll < COND_NOT_PROB + COND_AND_PROB + COND_OR_PROB:
-                return exp.Or(this=having_predicate(depth + 1), expression=having_predicate(depth + 1))
-        return having_leaf()
+    def having_aggregate_leaf() -> exp.Expression:
+        if type_tag == "string":
+            op = random.choice(
+                ["=", "<>", ">", "<", ">=", "<=", "LIKE", "IS", "IS NOT"]
+                + (["REGEXP"] if dialect_option(dialect, "supports_regexp", True) else [])
+            )
+        else:
+            op = random.choice(["=", "<>", ">", "<", ">=", "<=", "BETWEEN", "IS", "IS NOT"])
+        left = aggregate_having_operand()
+        if op == "IS":
+            return exp.Is(this=left, expression=exp.Null())
+        if op == "IS NOT":
+            return exp.Not(this=exp.Is(this=left, expression=exp.Null()))
+        if op == "BETWEEN":
+            return exp.Between(this=left, low=_literal_ast(type_tag), high=_literal_ast(type_tag))
+        if op == "LIKE":
+            return exp.Like(this=left, expression=_pattern_literal_ast("LIKE"))
+        if op == "REGEXP":
+            return exp.RegexpLike(this=left, expression=_pattern_literal_ast("REGEXP"))
+        return _cmp_ast(op, left, _literal_ast(type_tag) if random.random() < 0.45 else having_operand())
+
+    def having_predicate(leaf_budget: int = 3, logic_depth: int = 0) -> exp.Expression:
+        # Seed HAVING with an aggregate-involved predicate first, then combine.
+        expr = having_aggregate_leaf()
+        used_leaves = 1
+        depth = logic_depth
+        while used_leaves < leaf_budget and depth < 3:
+            if random.random() >= (COND_NOT_PROB + COND_AND_PROB + COND_OR_PROB):
+                break
+            next_expr = having_leaf()
+            if random.random() < COND_NOT_PROB:
+                next_expr = exp.Not(this=next_expr)
+            expr = (
+                exp.And(this=expr, expression=next_expr)
+                if random.random() < 0.5
+                else exp.Or(this=expr, expression=next_expr)
+            )
+            used_leaves += 1
+            depth += 1
+        return expr
 
     return _expr_sql(having_predicate(), dialect)
+
+
+def _is_scalar_subquery(subquery: exp.Subquery) -> bool:
+    parent = subquery.parent
+    if isinstance(parent, exp.In) and subquery.arg_key == "query":
+        return False
+    if isinstance(parent, (exp.Any, exp.All)) and subquery.arg_key == "this":
+        return False
+    if isinstance(parent, exp.Exists) and subquery.arg_key == "this":
+        return False
+    if isinstance(parent, exp.SetOperation):
+        return False
+    if isinstance(parent, (exp.From, exp.Join, exp.CTE, exp.Lateral)):
+        return False
+    return True
+
+
+def _select_is_in_scalar_subquery(select: exp.Select) -> bool:
+    current: exp.Expression | None = select
+    while current is not None:
+        if isinstance(current, exp.Subquery):
+            return _is_scalar_subquery(current)
+        current = current.parent
+    return False
+
+
+def _select_projection_exprs(select: exp.Select) -> list[exp.Expression]:
+    exprs: list[exp.Expression] = []
+    for item in select.expressions or []:
+        base = item.this if isinstance(item, exp.Alias) else item
+        if isinstance(base, exp.Expression):
+            exprs.append(base)
+    return exprs
+
+
+def _build_select_having_expr(select: exp.Select, dialect: str) -> exp.Expression:
+    projections = _select_projection_exprs(select)
+    expr_sqls = [_expr_sql(expr.copy(), dialect) for expr in projections] or ["1"]
+    typed_expr_sqls, type_tag, has_typed_pool = _pick_having_type_and_exprs(expr_sqls, dialect)
+    if not has_typed_pool:
+        return _fallback_having_expr()
+    plain_sqls = [sql for sql in typed_expr_sqls if not _setop_sqls_have_aggregate([sql], dialect)]
+    having_sql = _having_clause_for_grouped_exprs(
+        typed_expr_sqls,
+        type_tag,
+        dialect,
+        allow_plain_probe=True,
+        plain_probe_exprs=plain_sqls or typed_expr_sqls,
+    )
+    try:
+        parsed = sqlglot.parse_one(normalize_sqlglot_input(having_sql, dialect), read=_sqlglot_dialect(dialect))
+        if isinstance(parsed, exp.Expression):
+            return parsed
+    except Exception:
+        pass
+    return exp.GTE(this=exp.Count(this=exp.Star()), expression=exp.Literal.number(1))
+
+
+def _ensure_group_for_select_having(select: exp.Select, dialect: str) -> None:
+    probe_exprs: list[exp.Expression] = []
+    probe_exprs.extend(_select_projection_exprs(select))
+    where = select.args.get("where")
+    if isinstance(where, exp.Where) and isinstance(where.this, exp.Expression):
+        probe_exprs.append(where.this)
+    having = select.args.get("having")
+    if isinstance(having, exp.Having) and isinstance(having.this, exp.Expression):
+        probe_exprs.append(having.this)
+
+    has_aggregate_context = any(_setop_expr_has_aggregate(node) for node in probe_exprs)
+    group_cols: list[exp.Column] = []
+    seen: set[str] = set()
+    for node in probe_exprs:
+        for col in _collect_setop_group_columns(node):
+            key = col.sql(dialect=_sqlglot_dialect(dialect))
+            if key in seen:
+                continue
+            seen.add(key)
+            group_cols.append(col.copy())
+
+    if has_aggregate_context and group_cols and select.args.get("group") is None:
+        select.group_by(*group_cols, copy=False)
+
+
+def _inject_random_having_on_selects(root: exp.Expression, dialect: str, *, prob: float) -> None:
+    for select in list(root.find_all(exp.Select)):
+        if _select_is_in_scalar_subquery(select):
+            continue
+        if select.args.get("having") is not None:
+            continue
+        if random.random() >= prob:
+            continue
+        select.set("having", exp.Having(this=_build_select_having_expr(select, dialect)))
+        _ensure_group_for_select_having(select, dialect)
 
 
 def _select_core_for_setop(
@@ -1956,20 +2483,41 @@ def _select_core_for_setop(
     projection_items = _setop_projection_items(col_expr, type_tag, column_count, dialect)
     if projection_items:
         projection_items[0] = key_expr
+    probe_items_for_having, having_type_tag, has_typed_pool = _pick_having_type_and_exprs(
+        projection_items,
+        dialect,
+        preferred_type=type_tag,
+    )
+    plain_probe_items = [expr for expr in probe_items_for_having if not _setop_sqls_have_aggregate([expr], dialect)]
+    supports_having = bool(dialect_option(dialect, "supports_select_having", True))
+    want_having = bool(supports_having and random.random() < SETOP_HAVING_PROB)
     projection = _setop_projection(projection_items)
     select_prefix = "SELECT DISTINCT" if dialect_option(dialect, "supports_select_distinct", True) and random.random() < 0.2 else "SELECT"
     sql = f"{select_prefix} {projection} FROM {from_sql}"
-    if (
-        dialect_option(dialect, "supports_select_having", True)
-        and type_tag in {"numeric", "string", "date", "datetime"}
-        and random.random() < 0.2
-    ):
-        if dialect.lower().strip() == "monetdb":
-            group_cols = ", ".join("k" if i == 1 else f"k{i}" for i in range(1, len(projection_items) + 1))
+    having_pred: str | None = None
+    if want_having:
+        if has_typed_pool:
+            having_pred = _having_clause_for_grouped_exprs(
+                probe_items_for_having,
+                having_type_tag,
+                dialect,
+                allow_plain_probe=True,
+                plain_probe_exprs=plain_probe_items or probe_items_for_having,
+            )
         else:
-            group_cols = ", ".join(str(i) for i in range(1, len(projection_items) + 1))
-        having_pred = _having_clause_for_grouped_exprs(projection_items, type_tag, dialect)
-        sql += f" GROUP BY {group_cols} HAVING {having_pred}"
+            having_pred = _expr_sql(_fallback_having_expr(), dialect)
+    group_probe_exprs = list(projection_items)
+    if having_pred:
+        group_probe_exprs.append(having_pred)
+    has_aggregate_context = _setop_sqls_have_aggregate(group_probe_exprs, dialect)
+    group_items = _collect_setop_group_items(group_probe_exprs, dialect)
+    has_group = bool(has_aggregate_context and group_items)
+
+    if has_group:
+        sql += f" GROUP BY {', '.join(group_items)}"
+
+    if want_having:
+        sql += f" HAVING {having_pred}"
     return sql
 
 
@@ -2005,7 +2553,7 @@ def _select_stmt_for_setop(
             force_pk_key=force_pk_key,
         )
         op = random.choice(get_supported_set_ops(dialect))
-        return f"{left} {op} {right}"
+        return f"({left}) {op} ({right})"
     return _select_core_for_setop(
         schema,
         table_ids,
@@ -2329,8 +2877,6 @@ def _build_delete_rhs_query(
         select_ast.set("joins", source.joins)
     for filt in source.filters:
         select_ast = select_ast.where(filt, copy=False)
-    if source.limit is not None:
-        select_ast = select_ast.limit(source.limit, copy=False)
     if dialect_option(dialect, "supports_select_distinct", True) and random.random() < 0.25:
         select_ast.set("distinct", exp.Distinct())
     return select_ast
@@ -2503,6 +3049,53 @@ def _maybe_delete_select_filter(
     return f" AND ({predicate})"
 
 
+def _choose_delete_statement_mode(dialect: str, *, force_mode: str | None = None) -> str:
+    if force_mode is not None:
+        return force_mode
+    is_duckdb = dialect == "duckdb"
+    multi_supported = bool(dialect_option(dialect, "supports_delete_multi_table", True))
+    if is_duckdb and random.random() < DELETE_UNIFIED_JOIN_PROB:
+        return "using"
+    if multi_supported and random.random() < DELETE_UNIFIED_JOIN_PROB:
+        roll = random.random()
+        if roll < DELETE_UNIFIED_MULTI_TARGET_PROB:
+            return "multi_targets"
+        if roll < DELETE_UNIFIED_MULTI_TARGET_PROB + DELETE_UNIFIED_USING_PROB:
+            return "using"
+        return "joined"
+    return "single"
+
+
+def _choose_delete_primary_where_clause(
+    schema: dict,
+    table: str,
+    table_ids: dict,
+    dialect: str,
+    *,
+    protected_tables: set[str] | None = None,
+) -> str:
+    subquery_where = [where_in_subquery, where_exists_subquery]
+    basic_where = [where_op_condition, where_op_compound]
+    row_requirement = _delete_row_requirement_clause(schema, table, table_ids, dialect)
+    if random.random() < 0.2:
+        return row_requirement
+    if random.random() < SETOP_WHERE_STRATEGY_PROB:
+        return random.choice(subquery_where)(
+            schema,
+            table,
+            table_ids,
+            dialect,
+            protected_tables=protected_tables,
+        )
+    return random.choice(basic_where)(
+        schema,
+        table,
+        table_ids,
+        dialect,
+        protected_tables=protected_tables,
+    )
+
+
 def delete_unified(
     schema: dict,
     table_ids: dict,
@@ -2510,22 +3103,10 @@ def delete_unified(
     *,
     force_mode: str | None = None,
 ) -> str:
-    mode = force_mode or "single"
+    mode = _choose_delete_statement_mode(dialect, force_mode=force_mode)
     effective_dialect = dialect
     is_duckdb = dialect == "duckdb"
     multi_supported = dialect_option(dialect, "supports_delete_multi_table", True)
-
-    if force_mode is None:
-        if is_duckdb and random.random() < DELETE_UNIFIED_JOIN_PROB:
-            mode = "using"
-        elif multi_supported and random.random() < DELETE_UNIFIED_JOIN_PROB:
-            roll = random.random()
-            if roll < DELETE_UNIFIED_MULTI_TARGET_PROB:
-                mode = "multi_targets"
-            elif roll < DELETE_UNIFIED_MULTI_TARGET_PROB + DELETE_UNIFIED_USING_PROB:
-                mode = "using"
-            else:
-                mode = "joined"
 
     if mode == "single" or (not multi_supported and not (is_duckdb and mode == "using")):
         table = _pick_table(schema)
@@ -2538,24 +3119,20 @@ def delete_unified(
             dialect,
             protected_tables=protected_tables,
         )
-        subquery_where = [where_in_subquery, where_exists_subquery]
-        basic_where = [where_op_condition, where_op_compound]
-        if random.random() < SETOP_WHERE_STRATEGY_PROB:
-            where_clause = random.choice(subquery_where)(
-                schema,
-                table,
-                table_ids,
-                dialect,
-                protected_tables=protected_tables,
-            )
-        else:
-            where_clause = random.choice(basic_where)(
-                schema,
-                table,
-                table_ids,
-                dialect,
-                protected_tables=protected_tables,
-            )
+        where_clause = _choose_delete_primary_where_clause(
+            schema,
+            table,
+            table_ids,
+            dialect,
+            protected_tables=protected_tables,
+        )
+        where_clause = where_clause + _maybe_delete_select_filter(
+            schema,
+            table,
+            table_ids,
+            dialect,
+            protected_tables=protected_tables,
+        )
         if extra_pred:
             where_clause = f"({where_clause}) AND {extra_pred}"
         partition_clause = _partition_clause(schema, table, dialect)
@@ -2594,17 +3171,23 @@ def delete_unified(
         ref_table,
         ref_col,
         effective_dialect,
-        depth=2,
+        depth=0 if mode == "multi_targets" and not is_duckdb else 2,
         protected_tables=protected_tables,
     )
 
     if mode == "multi_targets" and not is_duckdb:
         where_clause = (
-            f"({_delete_row_requirement_clause(schema, table, table_ids, effective_dialect)}) AND "
+            f"({_choose_delete_primary_where_clause(schema, table, table_ids, effective_dialect, protected_tables=protected_tables)}) AND "
             f"({_delete_row_requirement_clause(schema, ref_table, table_ids, effective_dialect)})"
         )
     else:
-        where_clause = _delete_row_requirement_clause(schema, table, table_ids, effective_dialect)
+        where_clause = _choose_delete_primary_where_clause(
+            schema,
+            table,
+            table_ids,
+            effective_dialect,
+            protected_tables=protected_tables,
+        )
 
     where_clause = where_clause + _maybe_delete_select_filter(
         schema,

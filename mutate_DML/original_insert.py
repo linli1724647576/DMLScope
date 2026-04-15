@@ -23,6 +23,8 @@ INSERT_SELECT_SUBQUERY_TYPES = {"numeric", "string", "date", "datetime", "json"}
 INSERT_SELECT_COMPLEX_PROB = 0.75
 INSERT_SELECT_SOURCE_TYPES = ["numeric", "string", "date", "datetime"]
 INSERT_SELECT_GROUP_SAFE_TYPES = {"numeric", "string", "date", "datetime"}
+INSERT_SELECT_GROUP_PROB = 0.18
+INSERT_SELECT_HAVING_PROB = 0.18
 INSERT_SELECT_WINDOW_PROB = 0.2
 INSERT_ON_DUPLICATE_PROB = 0.2
 INSERT_VALUES_PROB = 0.05
@@ -123,6 +125,14 @@ def _normalize_sql_for_dialect(sql: str, dialect: str) -> str:
             sql = re.sub(pattern, repl, sql)
         return _rewrite_format_literals(sql)
     return sql
+
+
+def _split_logic_leaf_budget(total_leaves: int) -> tuple[int, int]:
+    if total_leaves <= 2:
+        return 1, 1
+    left = random.randint(1, total_leaves - 1)
+    right = total_leaves - left
+    return left, right
 
 
 def _parse_expr(sql: str, dialect: str) -> exp.Expression:
@@ -414,17 +424,24 @@ def _simple_scalar_subquery(
 ) -> exp.Expression:
     alias = f"ins_scalar_{random.randint(100, 999)}"
     col_ref = exp.column(column_name, table=alias)
+    agg = random.choice(["MAX", "MIN"])
+    agg_expr: exp.Expression = exp.Anonymous(this=agg, expressions=[col_ref.copy()])
     query = (
-        sqlglot.select(col_ref.copy())
+        sqlglot.select(agg_expr)
         .from_(exp.to_table(table_name).as_(alias, copy=False), copy=False)
         .where(_simple_scalar_predicate(type_tag, col_ref, schema=schema, dialect=dialect, table_ids=table_ids), copy=False)
-        .order_by(_ordered(col_ref, random.choice(["ASC", "DESC"])), copy=False)
-        .limit(1, copy=False)
     )
     return exp.Subquery(this=query)
 
 
-def _insert_having_clause(select_items: list[exp.Expression], expr_types: list[str], dialect: str) -> exp.Expression:
+def _insert_having_clause(
+    select_items: list[exp.Expression],
+    expr_types: list[str],
+    dialect: str,
+    *,
+    allow_plain_probe: bool,
+    plain_probe_items: list[exp.Expression] | None = None,
+) -> exp.Expression:
     typed_safe_exprs = [
         (expr, type_tag)
         for expr, type_tag in zip(select_items, expr_types)
@@ -435,6 +452,10 @@ def _insert_having_clause(select_items: list[exp.Expression], expr_types: list[s
         return exp.GTE(this=exp.Count(this=exp.Star()), expression=exp.Literal.number(1))
     type_tag = random.choice([t for _, t in typed_safe_exprs] or ["numeric"])
     typed_exprs = [expr for expr, expr_type in typed_safe_exprs if expr_type == type_tag] or safe_exprs
+    typed_plain_exprs = [
+        expr for expr, expr_type in typed_safe_exprs
+        if expr_type == type_tag and not _insert_expr_has_aggregate(expr)
+    ] or [expr for expr in (plain_probe_items or []) if not _insert_expr_has_aggregate(expr)]
     monetdb_safe = dialect.lower().strip() == "monetdb"
 
     def typed_literal() -> exp.Expression:
@@ -448,21 +469,34 @@ def _insert_having_clause(select_items: list[exp.Expression], expr_types: list[s
 
     def operand() -> exp.Expression:
         probe = random.choice(typed_exprs).copy()
-        options: list[exp.Expression] = [] if monetdb_safe else [probe]
+        plain_probe = random.choice(typed_plain_exprs).copy() if typed_plain_exprs else probe.copy()
+        options: list[exp.Expression] = [plain_probe] if allow_plain_probe and not monetdb_safe and typed_plain_exprs else []
         options.extend([
             exp.Min(this=probe.copy()),
             exp.Max(this=probe.copy()),
         ])
         if type_tag == "numeric":
             options.extend([
-                exp.Count(this=exp.Star()),
                 exp.Sum(this=probe.copy()),
                 exp.Avg(this=probe.copy()),
                 exp.Count(this=probe.copy()),
                 exp.Count(this=exp.Distinct(expressions=[probe.copy()])),
             ])
-        if not options:
-            options.append(exp.Count(this=exp.Star()))
+        return random.choice(options)
+
+    def aggregate_operand() -> exp.Expression:
+        probe = random.choice(typed_exprs).copy()
+        options: list[exp.Expression] = [
+            exp.Min(this=probe.copy()),
+            exp.Max(this=probe.copy()),
+        ]
+        if type_tag == "numeric":
+            options.extend([
+                exp.Sum(this=probe.copy()),
+                exp.Avg(this=probe.copy()),
+                exp.Count(this=probe.copy()),
+                exp.Count(this=exp.Distinct(expressions=[probe.copy()])),
+            ])
         return random.choice(options)
 
     def leaf() -> exp.Expression:
@@ -470,7 +504,8 @@ def _insert_having_clause(select_items: list[exp.Expression], expr_types: list[s
             op = random.choice(["=", "<>", ">", "<", ">=", "<=", "LIKE", "IS", "IS NOT"])
         else:
             op = random.choice(["=", "<>", ">", "<", ">=", "<=", "BETWEEN", "IS", "IS NOT"])
-        left = operand()
+        literal_compare = op in {"=", "<>", ">", "<", ">=", "<="} and random.random() < 0.35
+        left = aggregate_operand() if literal_compare else operand()
         if op == "IS":
             return exp.Is(this=left, expression=exp.Null())
         if op == "IS NOT":
@@ -486,24 +521,236 @@ def _insert_having_clause(select_items: list[exp.Expression], expr_types: list[s
             "<": exp.LT,
             ">=": exp.GTE,
             "<=": exp.LTE,
-        }[op](this=left, expression=operand())
+        }[op](this=left, expression=typed_literal() if literal_compare else operand())
 
-    def predicate(depth: int = 0) -> exp.Expression:
-        if depth < 2:
-            roll = random.random()
-            if roll < COND_NOT_PROB:
-                return exp.Not(this=predicate(depth + 1))
-            if roll < COND_NOT_PROB + COND_AND_PROB:
-                return exp.And(this=predicate(depth + 1), expression=predicate(depth + 1))
-            if roll < COND_NOT_PROB + COND_AND_PROB + COND_OR_PROB:
-                return exp.Or(this=predicate(depth + 1), expression=predicate(depth + 1))
-        return leaf()
+    def aggregate_leaf() -> exp.Expression:
+        if type_tag == "string":
+            op = random.choice(["=", "<>", ">", "<", ">=", "<=", "LIKE", "IS", "IS NOT"])
+        else:
+            op = random.choice(["=", "<>", ">", "<", ">=", "<=", "BETWEEN", "IS", "IS NOT"])
+        left = aggregate_operand()
+        if op == "IS":
+            return exp.Is(this=left, expression=exp.Null())
+        if op == "IS NOT":
+            return exp.Not(this=exp.Is(this=left, expression=exp.Null()))
+        if op == "BETWEEN":
+            return exp.Between(this=left, low=typed_literal(), high=typed_literal())
+        if op == "LIKE":
+            return exp.Like(this=left, expression=exp.Literal.string(f"%{rand_str(2, 4)}%"))
+        return {
+            "=": exp.EQ,
+            "<>": exp.NEQ,
+            ">": exp.GT,
+            "<": exp.LT,
+            ">=": exp.GTE,
+            "<=": exp.LTE,
+        }[op](this=left, expression=typed_literal() if random.random() < 0.45 else operand())
+
+    def predicate(leaf_budget: int = 3, logic_depth: int = 0) -> exp.Expression:
+        expr = aggregate_leaf()
+        used_leaves = 1
+        depth = logic_depth
+        while used_leaves < leaf_budget and depth < 3:
+            if random.random() >= (COND_NOT_PROB + COND_AND_PROB + COND_OR_PROB):
+                break
+            next_expr = leaf()
+            if random.random() < COND_NOT_PROB:
+                next_expr = exp.Not(this=next_expr)
+            expr = exp.And(this=expr, expression=next_expr) if random.random() < 0.5 else exp.Or(this=expr, expression=next_expr)
+            used_leaves += 1
+            depth += 1
+        return expr
 
     return predicate()
 
 
+def _is_scalar_subquery(subquery: exp.Subquery) -> bool:
+    parent = subquery.parent
+    if isinstance(parent, exp.In) and subquery.arg_key == "query":
+        return False
+    if isinstance(parent, (exp.Any, exp.All)) and subquery.arg_key == "this":
+        return False
+    if isinstance(parent, exp.Exists) and subquery.arg_key == "this":
+        return False
+    if isinstance(parent, exp.SetOperation):
+        return False
+    if isinstance(parent, (exp.From, exp.Join, exp.CTE, exp.Lateral)):
+        return False
+    return True
+
+
+def _select_is_in_scalar_subquery(select: exp.Select) -> bool:
+    current: exp.Expression | None = select
+    while current is not None:
+        if isinstance(current, exp.Subquery):
+            return _is_scalar_subquery(current)
+        current = current.parent
+    return False
+
+
+def _select_projection_exprs(select: exp.Select) -> list[exp.Expression]:
+    exprs: list[exp.Expression] = []
+    for item in select.expressions or []:
+        base = item.this if isinstance(item, exp.Alias) else item
+        if isinstance(base, exp.Expression):
+            exprs.append(base)
+    return exprs
+
+
+def _infer_insert_expr_type_tag(node: exp.Expression | None) -> str | None:
+    if node is None:
+        return None
+    if isinstance(node, exp.Alias):
+        return _infer_insert_expr_type_tag(node.this)
+    if isinstance(node, exp.Paren):
+        return _infer_insert_expr_type_tag(node.this)
+    if isinstance(node, exp.Cast):
+        cast_to = node.args.get("to")
+        if isinstance(cast_to, exp.DataType):
+            cast_type_tag = _type_tag_for_col_type(cast_to.sql(dialect="mysql"))
+            if cast_type_tag in INSERT_SELECT_GROUP_SAFE_TYPES:
+                return cast_type_tag
+    if isinstance(node, exp.Literal):
+        return "string" if node.is_string else "numeric"
+    if isinstance(node, (exp.Count, exp.Sum, exp.Avg)):
+        return "numeric"
+    if isinstance(node, (exp.Min, exp.Max)):
+        return _infer_insert_expr_type_tag(node.this)
+    if isinstance(node, (exp.Add, exp.Sub)):
+        if any(isinstance(child, exp.Interval) for child in node.iter_expressions()):
+            return "datetime"
+        return "numeric"
+    if isinstance(node, (exp.Mul, exp.Div, exp.Mod)):
+        return "numeric"
+    if isinstance(node, exp.Anonymous):
+        name = (node.name or "").upper()
+        if name in {"COUNT", "SUM", "AVG", "LENGTH", "CHAR_LENGTH", "DATEDIFF", "TIMESTAMPDIFF"}:
+            return "numeric"
+        if name in {"LOWER", "UPPER", "CONCAT", "SUBSTR", "SUBSTRING", "TRIM"}:
+            return "string"
+        if name in {"DATE", "CURDATE", "CURRENT_DATE"}:
+            return "date"
+        if name in {"NOW", "CURRENT_TIMESTAMP", "SYSDATE"}:
+            return "datetime"
+    cls = node.__class__.__name__.lower()
+    if cls in {"lower", "upper", "concat", "substr", "substring", "trim"}:
+        return "string"
+    if cls in {"length", "charlength", "datediff", "timestampdiff", "year", "month", "day", "hour", "minute", "second"}:
+        return "numeric"
+    if cls in {"currentdate", "date"}:
+        return "date"
+    if cls in {"currenttimestamp", "timestamp", "now"}:
+        return "datetime"
+    return None
+
+
+def _build_select_having_expr(select: exp.Select, dialect: str) -> exp.Expression:
+    projection_exprs = _select_projection_exprs(select) or [exp.Literal.number(1)]
+    expr_types = [(_infer_insert_expr_type_tag(expr) or "any") for expr in projection_exprs]
+    plain_probe_items = [expr.copy() for expr in projection_exprs if not _insert_expr_has_aggregate(expr)]
+    return _insert_having_clause(
+        projection_exprs,
+        expr_types,
+        dialect,
+        allow_plain_probe=True,
+        plain_probe_items=plain_probe_items,
+    )
+
+
+def _ensure_group_for_select_having(select: exp.Select, dialect: str) -> None:
+    probe_exprs: list[exp.Expression] = []
+    probe_exprs.extend(_select_projection_exprs(select))
+    where = select.args.get("where")
+    if isinstance(where, exp.Where) and isinstance(where.this, exp.Expression):
+        probe_exprs.append(where.this)
+    having = select.args.get("having")
+    if isinstance(having, exp.Having) and isinstance(having.this, exp.Expression):
+        probe_exprs.append(having.this)
+
+    has_aggregate_context = _insert_exprs_have_aggregate(probe_exprs)
+    group_items = _collect_insert_group_items(probe_exprs, dialect)
+    if has_aggregate_context and group_items and select.args.get("group") is None:
+        select.group_by(*[item.copy() for item in group_items], copy=False)
+
+
+def _inject_random_having_on_selects(root: exp.Expression, dialect: str, *, prob: float) -> None:
+    for select in list(root.find_all(exp.Select)):
+        if _select_is_in_scalar_subquery(select):
+            continue
+        if select.args.get("having") is not None:
+            continue
+        if random.random() >= prob:
+            continue
+        select.set("having", exp.Having(this=_build_select_having_expr(select, dialect)))
+        _ensure_group_for_select_having(select, dialect)
+
+
 def _expr_has_column_ref(expr: exp.Expression) -> bool:
     return any(True for _ in expr.find_all(exp.Column))
+
+
+def _collect_insert_group_columns(node: exp.Expression | None) -> list[exp.Column]:
+    if node is None:
+        return []
+    # Nested subqueries have independent scopes; do not leak their aliases into
+    # the current SELECT's GROUP BY list.
+    if isinstance(node, (exp.Subquery, exp.Select, exp.CTE)):
+        return []
+    if isinstance(node, exp.Window) and isinstance(node.this, exp.AggFunc):
+        return []
+    if isinstance(node, exp.AggFunc):
+        return []
+    if isinstance(node, exp.Column):
+        return [node.copy()]
+    cols: list[exp.Column] = []
+    for value in node.args.values():
+        if isinstance(value, exp.Expression):
+            if isinstance(value, (exp.Subquery, exp.Select, exp.CTE)):
+                continue
+            cols.extend(_collect_insert_group_columns(value))
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, exp.Expression):
+                    if isinstance(item, (exp.Subquery, exp.Select, exp.CTE)):
+                        continue
+                    cols.extend(_collect_insert_group_columns(item))
+    return cols
+
+
+def _collect_insert_group_items(
+    exprs: list[exp.Expression],
+    dialect: str,
+) -> list[exp.Expression]:
+    seen: set[str] = set()
+    group_items: list[exp.Expression] = []
+    for expr in exprs:
+        for col in _collect_insert_group_columns(expr):
+            key = col.sql(dialect=_sqlglot_dialect(dialect))
+            if key in seen:
+                continue
+            seen.add(key)
+            group_items.append(col)
+    return group_items
+
+
+def _insert_expr_has_aggregate(node: exp.Expression | None) -> bool:
+    if node is None:
+        return False
+    if isinstance(node, exp.Window) and isinstance(node.this, exp.AggFunc):
+        return True
+    if isinstance(node, exp.AggFunc):
+        return True
+    return any(_insert_expr_has_aggregate(child) for child in node.iter_expressions())
+
+
+def _insert_exprs_have_aggregate(exprs: list[exp.Expression]) -> bool:
+    return any(_insert_expr_has_aggregate(expr) for expr in exprs)
+
+
+def _apply_insert_group_by_items(select_ast: exp.Select, group_items: list[exp.Expression]) -> exp.Select:
+    if not group_items:
+        return select_ast
+    return select_ast.group_by(*[item.copy() for item in group_items], copy=False)
 
 
 def _insert_ignore(dialect: str) -> bool:
@@ -734,26 +981,38 @@ def _maybe_group_insert_select(
     expr_types: list[str],
     dialect: str,
 ) -> exp.Select:
-    if not (
-        dialect_option(dialect, "supports_select_having", True)
-        and all(type_tag in INSERT_SELECT_GROUP_SAFE_TYPES for type_tag in expr_types)
-        and random.random() < 0.2
-    ):
-        return select_ast
-    if dialect.lower().strip() == "monetdb":
-        group_items = [item.copy() for item in select_items if _expr_has_column_ref(item)] or [select_items[0].copy()]
-        select_ast = select_ast.group_by(*group_items, copy=False)
-    else:
-        select_ast = select_ast.group_by(
-            *[str(i) for i in range(1, len(select_items) + 1)],
-            copy=False,
-        )
-    return select_ast.having(
-        _insert_having_clause(
+    supports_having = bool(dialect_option(dialect, "supports_select_having", True))
+
+    safe_having = any(type_tag in INSERT_SELECT_GROUP_SAFE_TYPES for type_tag in expr_types)
+    want_having = bool(supports_having and safe_having and random.random() < INSERT_SELECT_HAVING_PROB)
+
+    group_probe_exprs = [expr.copy() for expr in select_items]
+    where = select_ast.args.get("where")
+    if isinstance(where, exp.Where) and isinstance(where.this, exp.Expression):
+        group_probe_exprs.append(where.this.copy())
+    plain_probe_items = [expr.copy() for expr in select_items if not _insert_expr_has_aggregate(expr)]
+    having_expr: exp.Expression | None = None
+    if want_having:
+        having_expr = _insert_having_clause(
             select_items,
             expr_types,
             dialect,
-        ),
+            allow_plain_probe=True,
+            plain_probe_items=plain_probe_items,
+        )
+        group_probe_exprs.append(having_expr.copy())
+    has_aggregate_context = _insert_exprs_have_aggregate(group_probe_exprs)
+    group_items = _collect_insert_group_items(group_probe_exprs, dialect)
+    has_group = False
+    if has_aggregate_context and group_items:
+        select_ast = _apply_insert_group_by_items(select_ast, group_items)
+        has_group = True
+
+    if not want_having:
+        return select_ast
+
+    return select_ast.having(
+        having_expr,
         dialect=_sqlglot_dialect(dialect),
         copy=False,
     )
@@ -781,6 +1040,7 @@ def _independent_insert_setop_branch(
                     stable_pk_expr,
                     pk_offset,
                     dialect,
+                    target_row_count=len(table_ids.get(table, [])),
                 )
             )
         else:
@@ -838,6 +1098,24 @@ def _wrap_insert_top_level_cte(query: exp.Expression, cols: list[str]) -> exp.Se
     return outer.with_(cte_name, as_=_query_with_output_aliases(query, cols), copy=False)
 
 
+def _query_has_with(query: exp.Expression) -> bool:
+    return bool(isinstance(query, exp.Expression) and query.args.get("with_") is not None)
+
+
+def _maybe_apply_insert_statement_with(
+    query: exp.Expression,
+    cols: list[str],
+    dialect: str,
+) -> exp.Expression:
+    if not dialect_option(dialect, "supports_dml_with", True):
+        return query
+    if random.random() >= INSERT_TOPLEVEL_CTE_PROB:
+        return query
+    if _query_has_with(query):
+        return query
+    return _wrap_insert_top_level_cte(query, cols)
+
+
 def _apply_insert_top_level_wrappers(
     query: exp.Expression,
     cols: list[str],
@@ -859,21 +1137,14 @@ def _apply_insert_top_level_wrappers(
         )
     if roll < INSERT_TOPLEVEL_SETOP_PROB + INSERT_TOPLEVEL_FROM_SUBQUERY_PROB:
         return _wrap_insert_top_level_from_subquery(query, cols)
-    if roll >= INSERT_TOPLEVEL_SETOP_PROB + INSERT_TOPLEVEL_FROM_SUBQUERY_PROB + INSERT_TOPLEVEL_CTE_PROB:
-        return query
-    if not dialect_option(dialect, "supports_dml_with", True):
-        return query
-    if isinstance(query, exp.Select) and query.args.get("with") is not None:
-        return query
-    return _wrap_insert_top_level_cte(query, cols)
+    return query
 
 
 def _limit_insert_target_rows(query: exp.Expression, *, dialect: str) -> exp.Expression:
-    if not isinstance(query, exp.Query):
-        return query
-    if query.args.get("limit") is not None:
-        return query
-    return query.limit(1, copy=False)
+    del dialect
+    # Keep generation-side SELECTs free of LIMIT unless LIMIT is explicitly
+    # introduced inside scalar subqueries by scalarization logic.
+    return query
 
 
 def _next_insert_row(schema: dict, table_ids: dict, dialect: str) -> tuple[str, list[str], dict]:
@@ -1009,6 +1280,7 @@ def _insert_values(
         replace=replace,
         returning=_maybe_insert_returning(schema, table, dialect),
     )
+    _inject_random_having_on_selects(stmt, dialect, prob=INSERT_SELECT_HAVING_PROB)
     return _render_sql(stmt, dialect) + ";"
 
 
@@ -1027,6 +1299,7 @@ def _insert_on_duplicate_values(schema: dict, table_ids: dict, dialect: str) -> 
         upsert=True,
         returning=_maybe_insert_returning(schema, table, dialect),
     )
+    _inject_random_having_on_selects(stmt, dialect, prob=INSERT_SELECT_HAVING_PROB)
     return _render_sql(stmt, dialect) + ";"
 
 
@@ -1197,27 +1470,65 @@ def _duckdb_unique_pk_expr(
     dialect: str,
     *,
     offset: int = 0,
+    target_row_count: int | None = None,
 ) -> exp.Expression:
     base = _pk_literal_expr(row_value, dialect)
     if offset > 0:
         base = exp.Add(this=base, expression=exp.Literal.number(offset))
     if stable_pk_expr is None:
         return base
-    row_number_expr = exp.Window(
-        this=exp.RowNumber(),
+
+    stable_pk_bigint = exp.Cast(this=stable_pk_expr.copy(), to=exp.DataType.build("BIGINT"))
+    stride_seed = max(64, (target_row_count or 0) + 1)
+    stride_expr = exp.Literal.number(stride_seed)
+
+    # Avoid ROW_NUMBER-based PK generation so that unrelated row additions
+    # do not globally renumber generated keys.
+    dup_ordinal_expr = exp.Window(
+        this=exp.Count(this=exp.Star()),
+        partition_by=[stable_pk_expr.copy()],
         order=exp.Order(expressions=[_ordered(stable_pk_expr.copy(), "ASC")]),
+        spec=exp.WindowSpec(
+            kind="ROWS",
+            start="UNBOUNDED",
+            start_side="PRECEDING",
+            end="CURRENT ROW",
+        ),
         over="OVER",
     )
-    unique_expr = exp.Sub(
-        this=exp.Add(this=base.copy(), expression=row_number_expr),
-        expression=exp.Literal.number(1),
+    dup_offset_expr = exp.Sub(this=dup_ordinal_expr, expression=exp.Literal.number(1))
+    stable_pk_offset_expr = exp.Mul(this=stable_pk_bigint, expression=stride_expr)
+    non_null_unique_expr = exp.Add(
+        this=exp.Add(this=base.copy(), expression=stable_pk_offset_expr),
+        expression=dup_offset_expr.copy(),
+    )
+    null_unique_expr = exp.Add(this=base.copy(), expression=dup_offset_expr.copy())
+    unique_expr = exp.Case(
+        ifs=[
+            exp.If(
+                this=exp.Is(this=stable_pk_expr.copy(), expression=exp.Null()),
+                true=null_unique_expr,
+            )
+        ],
+        default=non_null_unique_expr,
     )
     return exp.Coalesce(this=unique_expr, expressions=[base.copy()])
 
 
-def _fresh_insert_pk_expr(row_value: str, stable_pk_expr: exp.Expression | None, dialect: str) -> exp.Expression:
+def _fresh_insert_pk_expr(
+    row_value: str,
+    stable_pk_expr: exp.Expression | None,
+    dialect: str,
+    *,
+    target_row_count: int | None = None,
+) -> exp.Expression:
     if dialect == "duckdb":
-        return _duckdb_unique_pk_expr(row_value, stable_pk_expr, dialect)
+        return _duckdb_unique_pk_expr(
+            row_value,
+            stable_pk_expr,
+            dialect,
+            target_row_count=target_row_count,
+        )
     base = _pk_literal_expr(row_value, dialect)
     if stable_pk_expr is None:
         return base
@@ -1256,15 +1567,23 @@ def _fresh_insert_pk_expr_with_offset(
     stable_pk_expr: exp.Expression | None,
     offset: int,
     dialect: str,
+    *,
+    target_row_count: int | None = None,
 ) -> exp.Expression:
     if dialect == "duckdb":
-        return _duckdb_unique_pk_expr(row_value, stable_pk_expr, dialect, offset=offset)
+        return _duckdb_unique_pk_expr(
+            row_value,
+            stable_pk_expr,
+            dialect,
+            offset=offset,
+            target_row_count=target_row_count,
+        )
     return _stable_insert_pk_expr_with_offset(row_value, stable_pk_expr, offset, dialect)
 
 
 def _target_pk_scalar_subquery_sql(table: str, pk_col: str, *, desc: bool) -> str:
-    order = "DESC" if desc else "ASC"
-    return f"(SELECT {pk_col} FROM {table} WHERE {pk_col} IS NOT NULL ORDER BY {pk_col} {order} LIMIT 1)"
+    agg = "MAX" if desc else "MIN"
+    return f"(SELECT {agg}({pk_col}) FROM {table} WHERE {pk_col} IS NOT NULL)"
 
 
 def _upsert_insert_pk_expr(
@@ -1612,7 +1931,14 @@ def _insert_select(
             if upsert:
                 select_items.append(_upsert_insert_pk_expr(schema, table, row[col], table_ids, dialect))
             else:
-                select_items.append(_fresh_insert_pk_expr(row[col], stable_pk_expr, dialect))
+                select_items.append(
+                    _fresh_insert_pk_expr(
+                        row[col],
+                        stable_pk_expr,
+                        dialect,
+                        target_row_count=len(table_ids.get(table, [])),
+                    )
+                )
             continue
         select_items.append(_insert_select_expr(schema, table, col, row[col], table_ids, dialect, source))
 
@@ -1649,6 +1975,7 @@ def _insert_select(
         target_table=table,
         table_ids=table_ids,
     )
+    select_ast = _maybe_apply_insert_statement_with(select_ast, cols, dialect)
     if not upsert:
         select_ast = _limit_insert_target_rows(select_ast, dialect=dialect)
 
@@ -1679,6 +2006,7 @@ def _insert_select(
         by_name=by_name,
         returning=_maybe_insert_returning(schema, table, dialect),
     )
+    _inject_random_having_on_selects(stmt, dialect, prob=INSERT_SELECT_HAVING_PROB)
     sql = _render_sql(stmt, dialect)
     with_style = dialect_option(dialect, "insert_select_with_style", "before_select")
     if with_style == "statement_prefix":

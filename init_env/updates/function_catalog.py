@@ -17,8 +17,8 @@
     {"name": "STDDEV_SAMP", "min_args": 1, "max_args": 1, "arg_types": ["numeric"], "return_type": "DOUBLE", "category": "aggregate"},
     {"name": "VARIANCE", "min_args": 1, "max_args": 1, "arg_types": ["numeric"], "return_type": "DOUBLE", "category": "aggregate"},
     {"name": "VAR_SAMP", "min_args": 1, "max_args": 1, "arg_types": ["numeric"], "return_type": "DOUBLE", "category": "aggregate"},
-    {"name": "JSON_ARRAYAGG", "min_args": 1, "max_args": 1, "arg_types": ["string"], "return_type": "json", "category": "aggregate"},
-    {"name": "JSON_OBJECTAGG", "min_args": 2, "max_args": 2, "arg_types": ["string", "string"], "return_type": "json", "category": "aggregate"},
+    {"name": "JSON_ARRAYAGG", "min_args": 1, "max_args": 1, "arg_types": ["any"], "return_type": "json", "category": "aggregate"},
+    {"name": "JSON_OBJECTAGG", "min_args": 2, "max_args": 2, "arg_types": ["string", "any"], "return_type": "json", "category": "aggregate"},
 
     # Scalar string functions
     {"name": "CONCAT", "min_args": 2, "max_args": None, "arg_types": ["string", "string"], "return_type": "string", "category": "scalar"},
@@ -93,8 +93,8 @@
 
     # Scalar conditional functions
     {"name": "IF", "min_args": 3, "max_args": 3, "arg_types": ["any", "any", "any"], "return_type": "any", "category": "scalar"},
-    {"name": "IFNULL", "min_args": 2, "max_args": 2, "arg_types": ["any", "any"], "return_type": "string", "category": "scalar"},
-    {"name": "NULLIF", "min_args": 2, "max_args": 2, "arg_types": ["any", "any"], "return_type": "string", "category": "scalar"},
+    {"name": "IFNULL", "min_args": 2, "max_args": 2, "arg_types": ["any", "any"], "return_type": "any", "category": "scalar"},
+    {"name": "NULLIF", "min_args": 2, "max_args": 2, "arg_types": ["any", "any"], "return_type": "any", "category": "scalar"},
 
     # Scalar JSON functions
     {"name": "JSON_ARRAY", "min_args": 0, "max_args": None, "arg_types": [], "return_type": "json", "category": "scalar"},
