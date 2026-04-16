@@ -28,5 +28,5 @@ Transforming construct `C1` into `C2` achieves under-approximation, while transf
 |                  | `RIGHT JOIN`                | `INNER JOIN`                 |
 |                  | `HAVING TRUE`               | `HAVING P`                   |
 |                  | `GROUP BY ...`              | `GROUP BY ... HAVING P`      |
-|                  | `WHERE FALSE`               | `WHERE P`                    |
+|                  | `WHERE P`                   | `WHERE FALSE`                |
 |                  | `(remove WHERE)`            | `WHERE P`                    |
