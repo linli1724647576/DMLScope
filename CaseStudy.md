@@ -10,7 +10,7 @@ The root cause is an incorrect filter pushdown around LEFT JOIN LATERAL. In this
 
 The fix is to make filter pushdown outer-join aware. As illustrated in Figure (b), during optimization, each filter expression should be analyzed individually to determine which side of the join it depends on. For LEFT JOIN, only predicates that refer exclusively to the left side can be safely pushed down. Predicates involving the right side, especially those such as x.k IS NOT NULL that distinguish null-extended rows from real matches, must remain above the join. By preserving these filters after the join, the optimizer maintains the correct null semantics of LEFT JOIN LATERAL and prevents spurious NULL rows from being inserted into the target table.
 
-<img src="https://i.ibb.co/hxnxWTjS/0d2b472bb0cf1ae26ea7c559182b65fb.png" style="zoom: 67%;" />
+<img src="CaseStudy.assets/0d2b472bb0cf1ae26ea7c559182b65fb.png" style="zoom: 67%;" />
 
 
 
@@ -23,4 +23,4 @@ The root cause is incorrect predicate handling around OR when anti semantics (e.
 
 The fix is to propagate anti semantics explicitly in the selection construction path, as illustrated in Figure (b). Concretely, the implementation changes stmt *sin = (sell && sell->nrcols)?sel1:NULL; to stmt *sin = (sell && sell->nrcols && !anti)?sel1:NULL;, i.e., the anti flag is carried into candidate-list generation. By making this path anti-aware, MonetDB avoids incorrect predicate simplification effects under OR and restores stable, semantically correct UPDATE behavior.
 
-<img src="https://i.ibb.co/KcddHVk1/4ee91434b0768a2ba744a9d690dfbc9e.png"  />
+<img src="CaseStudy.assets/4ee91434b0768a2ba744a9d690dfbc9e.png"  />
